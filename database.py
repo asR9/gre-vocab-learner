@@ -20,7 +20,20 @@ def init_database():
             status TEXT DEFAULT 'unknown',
             attempts INTEGER DEFAULT 0,
             correct_attempts INTEGER DEFAULT 0,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            first_attempt BOOLEAN DEFAULT NULL,
+            example_sentence TEXT
+        )
+    """)
+    
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            word TEXT NOT NULL,
+            note_content TEXT NOT NULL,
+            note_type TEXT DEFAULT 'user',
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (word) REFERENCES vocabulary(word)
         )
     """)
     
@@ -30,11 +43,26 @@ def init_database():
             session_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             words_attempted TEXT,
             session_score REAL,
-            session_data TEXT
+            session_data TEXT,
+            session_type TEXT DEFAULT 'mixed',
+            notes_created INTEGER DEFAULT 0
         )
     """)
     
     conn.commit()
+    
+    # Add new columns to existing vocabulary table if they don't exist
+    try:
+        c.execute("ALTER TABLE vocabulary ADD COLUMN first_attempt BOOLEAN DEFAULT NULL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    try:
+        c.execute("ALTER TABLE vocabulary ADD COLUMN example_sentence TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
     # Seed with words if empty
     c.execute("SELECT COUNT(*) FROM vocabulary")
@@ -254,3 +282,125 @@ def search_words(query: str, limit: int = 10) -> List[Tuple[str, str]]:
     words = c.fetchall()
     conn.close()
     return words
+
+def save_note(word: str, note_content: str, note_type: str = 'user'):
+    """Save a note for a word"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("""
+        INSERT INTO user_notes (word, note_content, note_type)
+        VALUES (?, ?, ?)
+    """, (word, note_content, note_type))
+    
+    conn.commit()
+    conn.close()
+
+def get_notes_for_word(word: str) -> List[Tuple[str, str, str]]:
+    """Get all notes for a specific word"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT note_content, note_type, timestamp
+        FROM user_notes 
+        WHERE word = ?
+        ORDER BY timestamp DESC
+    """, (word,))
+    
+    notes = c.fetchall()
+    conn.close()
+    return notes
+
+def get_all_notes(limit: int = 50) -> List[Tuple[str, str, str, str]]:
+    """Get all notes with word information"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT n.word, n.note_content, n.note_type, n.timestamp
+        FROM user_notes n
+        ORDER BY n.timestamp DESC
+        LIMIT ?
+    """, (limit,))
+    
+    notes = c.fetchall()
+    conn.close()
+    return notes
+
+def batch_update_word_statuses_session_end(word_results: Dict[str, bool]):
+    """Update multiple word statuses at session end with first_attempt tracking"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    results = {}
+    for word, correct in word_results.items():
+        # Get current status and stats
+        c.execute("""
+            SELECT status, attempts, correct_attempts, first_attempt
+            FROM vocabulary 
+            WHERE word = ?
+        """, (word,))
+        
+        result = c.fetchone()
+        if not result:
+            continue
+        
+        current_status, attempts, correct_attempts, first_attempt = result
+        new_attempts = attempts + 1
+        new_correct = correct_attempts + (1 if correct else 0)
+        
+        # Track first attempt if this is the first time
+        if first_attempt is None:
+            first_attempt = correct
+        
+        # Enhanced status logic based on first attempt and performance
+        if first_attempt and correct and current_status == 'unknown':
+            new_status = 'strong'
+        elif not correct:
+            new_status = 'weak'
+        elif correct and current_status == 'weak':
+            new_status = 'moderate'
+        elif correct and current_status == 'moderate' and new_correct / new_attempts >= 0.8:
+            new_status = 'strong'
+        else:
+            new_status = current_status
+        
+        # Update database
+        c.execute("""
+            UPDATE vocabulary 
+            SET status = ?, attempts = ?, correct_attempts = ?, 
+                last_seen = CURRENT_TIMESTAMP, first_attempt = ?
+            WHERE word = ?
+        """, (new_status, new_attempts, new_correct, first_attempt, word))
+        
+        results[word] = new_status
+    
+    conn.commit()
+    conn.close()
+    return results
+
+def get_example_sentence(word: str) -> str:
+    """Get example sentence for a word"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("SELECT example_sentence FROM vocabulary WHERE word = ?", (word,))
+    result = c.fetchone()
+    conn.close()
+    
+    return result[0] if result and result[0] else None
+
+def save_example_sentence(word: str, sentence: str):
+    """Save example sentence for a word"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute("""
+        UPDATE vocabulary 
+        SET example_sentence = ?
+        WHERE word = ?
+    """, (sentence, word))
+    
+    conn.commit()
+    conn.close()

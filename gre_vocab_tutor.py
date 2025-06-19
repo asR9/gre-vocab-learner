@@ -1,7 +1,7 @@
 from typing import Dict, List, Any, TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage
+from langchain_core.messages import HumanMessage
 import random
 import json
 from database import (
@@ -15,29 +15,27 @@ from database import (
     get_notes_for_word,
     get_all_notes,
     get_example_sentence,
-    save_example_sentence
+    save_example_sentence,
+    get_word_status_counts
 )
-from intent_classifier import IntentClassifier
 from rag_system import RAGSystem
 
 class AgentState(TypedDict):
     messages: List[Dict[str, str]]
     current_mode: str
     session_quiz_performance: Dict[str, Any]
-    generated_mnemonics: Dict[str, str]
-    user_notes: Dict[str, str]
     current_quiz_words: List[tuple]
     waiting_for_quiz_answers: bool
-    waiting_for_hint: bool
     last_user_input: str
     session_active: bool
-    pending_updates: Dict[str, bool]  # For session-end batch updates
+    pending_updates: Dict[str, bool]
     conversation_context: List[Dict[str, str]]
+    study_words_cache: List[tuple]  # Recently studied words for notes integration
+    last_action: str  # Track last node for context
 
 class GREVocabAgent:
     def __init__(self):
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
-        self.intent_classifier = IntentClassifier()
         # Initialize RAG system
         try:
             self.rag_system = RAGSystem()
@@ -53,18 +51,16 @@ class GREVocabAgent:
                 "words_attempted": [],
                 "correct_answers": [],
                 "incorrect_answers": [],
-                "weak_words": [],
                 "session_score": 0.0
             },
-            generated_mnemonics={},
-            user_notes={},
             current_quiz_words=[],
             waiting_for_quiz_answers=False,
-            waiting_for_hint=False,
             last_user_input="",
             session_active=False,
             pending_updates={},
-            conversation_context=[]
+            conversation_context=[],
+            study_words_cache=[],
+            last_action=""
         )
         self.graph = self._build_graph()
 
@@ -74,13 +70,10 @@ class GREVocabAgent:
         workflow.add_node("router", self._router_node)
         workflow.add_node("start_quiz", self._quiz_node)
         workflow.add_node("study_words", self._study_node)
-        workflow.add_node("add_note", self._notes_node)
-        workflow.add_node("view_notes", self._notes_node)
-        workflow.add_node("summarize_notes", self._summarize_notes_node)
-        workflow.add_node("get_hints", self._hints_node)
+        workflow.add_node("notes", self._notes_node)
+        workflow.add_node("progress", self._progress_node)
+        workflow.add_node("reset_progress", self._reset_node)
         workflow.add_node("end_session", self._end_session_node)
-        workflow.add_node("search_words", self._search_words_node)
-        workflow.add_node("get_progress", self._progress_node)
         workflow.add_node("general", self._general_node)
 
         workflow.set_entry_point("router")
@@ -91,22 +84,18 @@ class GREVocabAgent:
             {
                 "start_quiz": "start_quiz",
                 "study_words": "study_words",
-                "add_note": "add_note",
-                "view_notes": "view_notes",
-                "summarize_notes": "summarize_notes",
-                "get_hints": "get_hints",
+                "notes": "notes",
+                "progress": "progress",
+                "reset_progress": "reset_progress",
                 "end_session": "end_session",
-                "search_words": "search_words",
-                "get_progress": "get_progress",
                 "general": "general",
                 "end": END
             }
         )
 
         # All nodes end the workflow
-        for node in ["start_quiz", "study_words", "add_note", "view_notes", 
-                    "summarize_notes", "get_hints", "end_session", "search_words", 
-                    "get_progress", "general"]:
+        for node in ["start_quiz", "study_words", "notes", "progress", 
+                    "reset_progress", "end_session", "general"]:
             workflow.add_edge(node, END)
 
         return workflow.compile()
@@ -114,27 +103,235 @@ class GREVocabAgent:
     def _router_node(self, state: AgentState) -> AgentState:
         user_input = state["last_user_input"]
 
-        # Handle special cases first
+        # Handle quiz answers first
         if state["waiting_for_quiz_answers"]:
-            if "hint" in user_input.lower():
-                state["current_mode"] = "get_hints"
-                state["waiting_for_hint"] = True
-            else:
-                state["current_mode"] = "start_quiz"  # Process quiz answers
+            state["current_mode"] = "start_quiz"
             return state
 
-        # Use LLM-based intent classification
-        try:
-            intent_result = self.intent_classifier.classify_intent(
-                user_input, 
-                state["conversation_context"]
-            )
-            state["current_mode"] = intent_result["intent"]
-        except Exception as e:
-            print(f"Intent classification error: {e}")
-            state["current_mode"] = "general"
+        # Check for natural language notes commands first
+        notes_action = self._check_notes_commands(user_input, state)
+        if notes_action:
+            return self._handle_notes_command(state, notes_action)
 
+        # Classify intent using merged LLM classification
+        intent = self._classify_intent(user_input, state)
+        state["current_mode"] = intent
+        
         return state
+    
+    def _check_notes_commands(self, user_input: str, state: AgentState) -> Dict:
+        """Check for natural language notes commands like 'move X to notes'"""
+        
+        # Build context from study session
+        study_context = ""
+        if state["study_words_cache"]:
+            studied_words = [w[0] for w in state["study_words_cache"]]
+            study_context = f"Recently studied words: {studied_words}"
+        
+        prompt = f"""
+        Check if this is a notes-related command for a vocabulary app.
+        
+        Context: {study_context}
+        User input: "{user_input}"
+        
+        Detect these patterns:
+        1. "move [word] to notes" - move specific word from study to notes
+        2. "move all to notes" - move all studied words to notes
+        3. "move [word1] and [word2] to notes" - move multiple specific words
+        4. Questions about notes like "what notes do I have about memory?"
+        5. Regular note commands like "note for [word]: [content]"
+        
+        If it's a notes command, respond in JSON:
+        {{
+            "is_notes_command": true,
+            "action": "move_to_notes|query_notes|add_note",
+            "words": ["word1", "word2"] or null,
+            "query": "search query" or null,
+            "note_content": "content" or null
+        }}
+        
+        If not a notes command, respond:
+        {{"is_notes_command": false}}
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            result = json.loads(response.content.strip())
+            return result if result.get("is_notes_command") else None
+        except Exception as e:
+            print(f"Notes command detection error: {e}")
+            # Fallback: simple pattern matching
+            user_input_lower = user_input.lower()
+            if "move" in user_input_lower and "notes" in user_input_lower:
+                if "all" in user_input_lower:
+                    return {"is_notes_command": True, "action": "move_to_notes", "words": ["all"]}
+                else:
+                    # Try to extract word names
+                    words = []
+                    if study_context:
+                        for word, _ in state.get("study_words_cache", []):
+                            if word.lower() in user_input_lower:
+                                words.append(word)
+                    return {"is_notes_command": True, "action": "move_to_notes", "words": words}
+            elif "note for" in user_input_lower:
+                return {"is_notes_command": True, "action": "add_note"}
+            return None
+    
+    def _handle_notes_command(self, state: AgentState, notes_action: Dict) -> AgentState:
+        """Handle natural language notes commands"""
+        action = notes_action.get("action")
+        
+        if action == "move_to_notes":
+            return self._move_study_to_notes(state, notes_action)
+        elif action == "query_notes":
+            return self._query_notes_document(state, notes_action)
+        elif action == "add_note":
+            # Process the note directly instead of just setting mode
+            state["current_mode"] = "notes"
+            return self._notes_node(state)
+        else:
+            state["current_mode"] = "notes"
+            return state
+    
+    def _move_study_to_notes(self, state: AgentState, notes_action: Dict) -> AgentState:
+        """Move study content to notes"""
+        if not state["study_words_cache"]:
+            response = "No recent study session to move to notes. Try studying first!"
+            state["messages"].append({"role": "assistant", "content": response})
+            return state
+        
+        words_to_move = notes_action.get("words", [])
+        
+        # If no specific words mentioned, move all
+        if not words_to_move or "all" in str(words_to_move).lower():
+            words_to_move = [w[0] for w in state["study_words_cache"]]
+        
+        moved_count = 0
+        response = "📝 **Moved to Notes:**\n\n"
+        
+        for word_name in words_to_move:
+            # Find the word in study cache
+            study_word = None
+            for word, definition in state["study_words_cache"]:
+                if word.lower() == word_name.lower():
+                    study_word = (word, definition)
+                    break
+            
+            if study_word:
+                word, definition = study_word
+                
+                # Create comprehensive note from study content
+                note_content = f"Definition: {definition}"
+                
+                # Add example if available
+                example = get_example_sentence(word)
+                if example:
+                    note_content += f" | Example: {example}"
+                
+                # Save to database and RAG
+                save_note(word, note_content, "study_moved")
+                if self.rag_system:
+                    try:
+                        self.rag_system.add_note_to_rag(word, note_content, "study_moved")
+                    except:
+                        pass
+                
+                response += f"• **{word.upper()}**: {note_content}\n"
+                moved_count += 1
+        
+        if moved_count > 0:
+            response += f"\n✅ Moved {moved_count} word(s) to your notes!\n"
+            response += "💡 **Try asking:** 'What notes do I have about memory tricks?' or 'Show me all my notes'"
+        else:
+            response = "❌ Couldn't find those words in your recent study session."
+        
+        state["messages"].append({"role": "assistant", "content": response})
+        state["last_action"] = "notes"
+        return state
+    
+    def _query_notes_document(self, state: AgentState, notes_action: Dict) -> AgentState:
+        """Query notes like a document using RAG"""
+        query = notes_action.get("query", "")
+        
+        if not query:
+            # Show all notes if no specific query
+            state["current_mode"] = "notes"
+            return state
+        
+        if not self.rag_system:
+            response = "RAG system not available for note search."
+            state["messages"].append({"role": "assistant", "content": response})
+            return state
+        
+        try:
+            # Use RAG to search notes semantically
+            similar_notes = self.rag_system.search_similar_notes(query, 10)
+            
+            if similar_notes:
+                response = f"🔍 **Notes about '{query}':**\n\n"
+                
+                for note in similar_notes:
+                    similarity_pct = note["similarity"] * 100
+                    response += f"**{note['word'].upper()}** ({similarity_pct:.0f}% match)\n"
+                    response += f"• {note['note']}\n\n"
+                
+                response += "💡 **Ask me anything about your notes!** Like:\n"
+                response += "• 'Which words are about memory techniques?'\n"
+                response += "• 'What have I learned about difficult words?'\n"
+                response += "• 'Show me notes with examples'\n"
+            else:
+                response = f"No notes found matching '{query}'. Try different search terms or add more notes first."
+        except Exception as e:
+            response = f"Error searching notes: {e}"
+        
+        state["messages"].append({"role": "assistant", "content": response})
+        state["last_action"] = "notes"
+        return state
+    
+    def _classify_intent(self, user_input: str, state: AgentState) -> str:
+        """Merged intent classification using LLM"""
+        
+        # Build context from recent conversation and last action
+        context_text = ""
+        if state["conversation_context"]:
+            recent_messages = state["conversation_context"][-2:]
+            context_text = "\n".join([
+                f"{msg['role']}: {msg['content'][:100]}..." 
+                for msg in recent_messages
+            ])
+        
+        if state["last_action"]:
+            context_text += f"\nLast action: {state['last_action']}"
+        
+        if state["study_words_cache"]:
+            context_text += f"\nRecently studied words: {[w[0] for w in state['study_words_cache'][:3]]}"
+
+        prompt = f"""
+        Classify the user's intent for a GRE vocabulary learning app.
+        
+        Available intents:
+        - start_quiz: wants to take a quiz or practice (e.g., "quiz", "test me", "quiz 5 words")
+        - study_words: wants to study/review words (e.g., "study", "review words", "show difficult words")
+        - notes: wants to add, view, or manage notes (e.g., "add note", "view notes", "note for sparse")
+        - progress: wants to see progress/statistics (e.g., "dashboard", "my progress", "how am I doing")
+        - reset_progress: wants to reset all progress (e.g., "reset", "start over", "clear progress")
+        - end_session: wants to end current session (e.g., "end session", "finish", "save progress")
+        - general: general conversation or unclear intent
+        
+        Context: {context_text}
+        User input: "{user_input}"
+        
+        Respond with only the intent name.
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            intent = response.content.strip().lower()
+            
+            valid_intents = ["start_quiz", "study_words", "notes", "progress", "reset_progress", "end_session", "general"]
+            return intent if intent in valid_intents else "general"
+        except:
+            return "general"
 
     def _route_decision(self, state: AgentState) -> str:
         return state["current_mode"]
@@ -151,84 +348,74 @@ class GREVocabAgent:
         user_input = state["last_user_input"]
 
         # Extract quiz parameters using LLM
-        try:
-            quiz_params = self.intent_classifier.extract_quiz_parameters(user_input)
-        except:
-            quiz_params = {"word_count": 5, "specific_words": [], "difficulty": None, "focus_status": None}
+        quiz_params = self._extract_quiz_parameters(user_input)
 
         # Start session if not active
         if not state["session_active"]:
             state["session_active"] = True
             state["pending_updates"] = {}
 
-        # Get quiz words based on parameters
-        if quiz_params["specific_words"]:
-            from database import search_words
-            quiz_words = []
-            for word in quiz_params["specific_words"]:
-                matches = search_words(word, 1)
-                if matches:
-                    quiz_words.append(matches[0])
-        elif quiz_params["focus_status"]:
-            quiz_words = get_words_by_status(quiz_params["focus_status"], quiz_params["word_count"])
-        else:
-            # Smart selection: prioritize unknown/weak words
-            unknown_words = get_words_by_status("unknown", quiz_params["word_count"] // 2)
-            weak_words = get_words_by_status("weak", quiz_params["word_count"] // 2)
-            remaining = quiz_params["word_count"] - len(unknown_words) - len(weak_words)
-            
-            if remaining > 0:
-                other_words = sample_words_for_quiz(remaining)
-                quiz_words = unknown_words + weak_words + other_words
-            else:
-                quiz_words = unknown_words + weak_words
+        # Get quiz words using database sampling
+        quiz_words = sample_words_for_quiz(quiz_params["word_count"])
 
         if not quiz_words:
             response = "Sorry, couldn't generate quiz. Database might be empty."
             state["messages"].append({"role": "assistant", "content": response})
             return state
 
-        # Limit to requested count
-        quiz_words = quiz_words[:quiz_params["word_count"]]
         state["current_quiz_words"] = quiz_words
         state["waiting_for_quiz_answers"] = True
+        state["last_action"] = "quiz"
 
-        # Create enhanced quiz with better formatting
+        # Create quiz with better formatting
         response = f"🧠 **Quiz Time!** ({len(quiz_words)} words)\n\n"
         for i, (word, _) in enumerate(quiz_words, 1):
             response += f"**{i}. {word.upper()}**\n"
         
-        response += f"\n💡 **Instructions:**\n"
-        response += f"• Provide definitions for each word\n"
-        response += f"• You can number them or just list them\n"
-        response += f"• Type 'hint' if you need help with any word\n"
-        response += f"• Session will save progress when you're done\n"
+        response += f"\n💡 **Instructions:** Provide definitions for each word (number them or just list them)\n"
 
         state["messages"].append({"role": "assistant", "content": response})
         return state
+    
+    def _extract_quiz_parameters(self, user_input: str) -> Dict:
+        """Extract quiz parameters from user input using simple regex"""
+        import re
+        
+        # Look for numbers in the input
+        numbers = re.findall(r'\b(\d+)\b', user_input.lower())
+        
+        if numbers:
+            # Take the first number found
+            count = int(numbers[0])
+            # Clamp between 1 and 10
+            count = min(max(count, 1), 10)
+            return {"word_count": count}
+        else:
+            # Default to 5 if no number found
+            return {"word_count": 5}
+    
+
 
     def _process_quiz_answers(self, state: AgentState) -> AgentState:
         user_answers = state["last_user_input"]
         quiz_words = state["current_quiz_words"]
 
-        # Grade answers using enhanced LLM grading
-        results, detailed_feedback = self._grade_answers_enhanced(quiz_words, user_answers)
+        # Grade answers using LLM
+        results = self._grade_answers(quiz_words, user_answers)
 
-        # Create comprehensive feedback
+        # Create simplified feedback summary
         feedback = "📊 **Quiz Results:**\n\n"
         
+        correct_count = 0
         for word, correct_def in quiz_words:
             is_correct = results.get(word, False)
-            status = "✅ Correct" if is_correct else "❌ Incorrect"
+            if is_correct:
+                correct_count += 1
             
-            feedback += f"**{word.upper()}**: {status}\n"
-            feedback += f"*Correct Definition:* {correct_def}\n"
+            status = "✅" if is_correct else "❌"
+            feedback += f"{status} **{word.upper()}**: {correct_def}\n"
             
-            # Add detailed feedback from LLM
-            if word in detailed_feedback:
-                feedback += f"*Feedback:* {detailed_feedback[word]}\n"
-            
-            # Add example sentence if available
+            # Add example sentence
             example = get_example_sentence(word)
             if not example:
                 example = self._generate_example_sentence(word, correct_def)
@@ -236,38 +423,31 @@ class GREVocabAgent:
                     save_example_sentence(word, example)
             
             if example:
-                feedback += f"*Example:* {example}\n"
-            
+                feedback += f"   *Example: {example}*\n"
             feedback += "\n"
 
         # Update performance tracking
-        correct_count = sum(results.values())
         total_count = len(results)
         session_score = correct_count / total_count if total_count > 0 else 0
 
         state["session_quiz_performance"]["words_attempted"].extend([w for w, _ in quiz_words])
         state["session_quiz_performance"]["correct_answers"].extend([w for w, correct in results.items() if correct])
         state["session_quiz_performance"]["incorrect_answers"].extend([w for w, correct in results.items() if not correct])
-        state["session_quiz_performance"]["weak_words"].extend([w for w, correct in results.items() if not correct])
         state["session_quiz_performance"]["session_score"] = session_score
 
-        # Store results for session-end batch update
-        state["pending_updates"].update(results)
+        # Update word statuses immediately
+        for word, correct in results.items():
+            update_word_status(word, correct)
 
-        # Performance summary with encouragement
-        feedback += f"📈 **Session Score: {session_score:.1%}** ({correct_count}/{total_count})\n"
+        # Performance summary
+        feedback += f"📈 **Score: {session_score:.1%}** ({correct_count}/{total_count})\n\n"
         
         if session_score >= 0.8:
-            feedback += "🎉 Excellent work! You're mastering these words!\n"
+            feedback += "🎉 Excellent work!\n"
         elif session_score >= 0.6:
-            feedback += "👍 Good progress! Keep practicing the challenging ones.\n"
+            feedback += "👍 Good progress!\n"
         else:
-            feedback += "💪 Don't worry! Review the definitions and try again.\n"
-
-        feedback += "\n**What's next?**\n"
-        feedback += "• 'quiz' - Take another quiz\n"
-        feedback += "• 'study' - Review difficult words\n"
-        feedback += "• 'end session' - Save progress and finish\n"
+            feedback += "💪 Keep practicing!\n"
 
         # Reset quiz state
         state["current_quiz_words"] = []
@@ -276,40 +456,35 @@ class GREVocabAgent:
         state["messages"].append({"role": "assistant", "content": feedback})
         return state
 
-    def _grade_answers_enhanced(self, quiz_words: List[tuple], user_answers: str) -> tuple[Dict[str, bool], Dict[str, str]]:
-        """Grade answers using enhanced LLM with detailed feedback"""
+    def _grade_answers(self, quiz_words: List[tuple], user_answers: str) -> Dict[str, bool]:
+        """Grade answers using simplified LLM"""
         results = {}
-        detailed_feedback = {}
 
-        # Create a comprehensive grading prompt for all words at once
-        words_info = ""
-        for i, (word, correct_def) in enumerate(quiz_words, 1):
-            words_info += f"{i}. {word} = {correct_def}\n"
+        words_info = "\n".join([f"{word}: {definition}" for word, definition in quiz_words])
 
         prompt = f"""
-        Grade the user's quiz answers and provide detailed feedback.
-
-        Quiz words and correct definitions:
+        Grade these quiz answers fairly. Accept correct definitions, close synonyms, and reasonable interpretations.
+        
+        Words and correct definitions:
         {words_info}
-
+        
         User's answers: "{user_answers}"
-
-        For each word, determine if the user's answer shows understanding of the core meaning.
-        Be generous - if they capture the essence, even with different wording, mark as correct.
-
+        
+        Mark as CORRECT if the user:
+        - Gives the correct definition or close synonym
+        - Shows clear understanding of the main meaning
+        - Uses related words that capture the essence
+        
+        Mark as INCORRECT if:
+        - Definition is wrong or unrelated
+        - Shows no understanding of the word
+        - Gives opposite meaning
+        - No answer provided for that word
+        
+        Be fair but not overly generous.
+        
         Respond in JSON format:
-        {{
-            "word1": {{
-                "correct": true/false,
-                "feedback": "Brief explanation of why correct/incorrect and encouragement"
-            }},
-            "word2": {{
-                "correct": true/false,
-                "feedback": "Brief explanation..."
-            }}
-        }}
-
-        Make feedback encouraging and educational. For incorrect answers, gently explain the correct meaning.
+        {{"word1": true/false, "word2": true/false, ...}}
         """
 
         try:
@@ -317,52 +492,32 @@ class GREVocabAgent:
             grading_result = json.loads(response.content.strip())
             
             for word, _ in quiz_words:
-                word_key = word.lower()
-                if word_key in grading_result:
-                    results[word] = grading_result[word_key]["correct"]
-                    detailed_feedback[word] = grading_result[word_key]["feedback"]
-                else:
-                    # Fallback to individual grading
-                    results[word] = self._grade_single_answer_llm(word, _, user_answers)
-                    detailed_feedback[word] = "Good effort!"
-        except Exception as e:
-            print(f"Enhanced grading error: {e}")
-            # Fallback to simple grading
+                results[word] = grading_result.get(word.lower(), False)
+        except:
+            # Fallback: grade each word individually
             for word, correct_def in quiz_words:
-                results[word] = self._grade_single_answer_llm(word, correct_def, user_answers)
-                detailed_feedback[word] = "Keep practicing!"
-
-        return results, detailed_feedback
-
-    def _grade_answers(self, quiz_words: List[tuple], user_answers: str) -> Dict[str, bool]:
-        """Grade answers using LLM only (legacy method)"""
-        results = {}
-
-        # Use LLM for all grading
-        for word, correct_def in quiz_words:
-            results[word] = self._grade_single_answer_llm(word, correct_def, user_answers)
+                results[word] = self._grade_single_word(word, correct_def, user_answers)
 
         return results
 
-    def _grade_single_answer_llm(self, word: str, correct_def: str, user_answers: str) -> bool:
-        """Grade a single answer using LLM"""
+    def _grade_single_word(self, word: str, correct_def: str, user_answers: str) -> bool:
+        """Grade a single word with fair scoring"""
         prompt = f"""
-        The word is "{word}" and the correct definition is "{correct_def}".
-
-        The user provided these answers: "{user_answers}"
-
-        Does any part of the user's answer show they understand what "{word}" means?
-        Be generous - if they capture the core meaning, even with different words, that's correct.
-
-        Examples of correct understanding:
-        - "illicit" = "forbidden by law" should match "illegal", "against the law", "prohibited", "unlawful"
-        - "sophomoric" = "conceited and overconfident" should match "arrogant", "pretentious", "showing off knowledge"
-
+        Does the user's answer show correct understanding of "{word}" (definition: "{correct_def}")?
+        
+        User's answers: "{user_answers}"
+        
+        Accept correct definitions, close synonyms, and reasonable interpretations.
+        Reject wrong definitions, unrelated answers, or no attempt.
+        
         Answer only "YES" or "NO".
         """
-
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        return "yes" in response.content.lower()
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            return "yes" in response.content.lower()
+        except:
+            return False
 
     def _generate_example_sentence(self, word: str, definition: str) -> str:
         """Generate an example sentence for a word"""
@@ -555,80 +710,147 @@ class GREVocabAgent:
         return state
 
     def _progress_node(self, state: AgentState) -> AgentState:
-        """Show user progress and statistics"""
+        """Enhanced progress dashboard"""
         try:
-            from database import get_word_status_counts
             status_counts = get_word_status_counts()
-            
             total_words = sum(status_counts.values())
-            mastered = status_counts.get('strong', 0)
-            learning = status_counts.get('moderate', 0)
-            weak = status_counts.get('weak', 0)
-            unknown = status_counts.get('unknown', 0)
             
-            mastery_rate = mastered / total_words if total_words > 0 else 0
+            if total_words == 0:
+                response = "📊 **Dashboard**: No vocabulary data yet. Start with a quiz!"
+                state["messages"].append({"role": "assistant", "content": response})
+                return state
             
-            response = "📊 **Your Progress Dashboard:**\n\n"
-            response += f"**Overall Stats:**\n"
-            response += f"• Total Words: {total_words}\n"
-            response += f"• Mastery Rate: {mastery_rate:.1%}\n\n"
+            # Calculate percentages
+            strong_pct = (status_counts['strong'] / total_words) * 100
+            moderate_pct = (status_counts['moderate'] / total_words) * 100
+            weak_pct = (status_counts['weak'] / total_words) * 100
+            unknown_pct = (status_counts['unknown'] / total_words) * 100
             
-            response += f"**Word Status Breakdown:**\n"
-            response += f"🟢 Strong: {mastered} words\n"
-            response += f"🟡 Moderate: {learning} words\n"
-            response += f"🟠 Weak: {weak} words\n"
-            response += f"⚪ Unknown: {unknown} words\n\n"
+            response = "📊 **Your Vocabulary Progress**\n\n"
+            response += f"**Total Words:** {total_words}\n\n"
             
-            # Session stats if available
-            if state["session_active"]:
+            response += "**Progress Breakdown:**\n"
+            response += f"🟢 **Strong:** {status_counts['strong']} ({strong_pct:.1f}%)\n"
+            response += f"🟡 **Moderate:** {status_counts['moderate']} ({moderate_pct:.1f}%)\n"
+            response += f"🟠 **Weak:** {status_counts['weak']} ({weak_pct:.1f}%)\n"
+            response += f"⚪ **Unknown:** {status_counts['unknown']} ({unknown_pct:.1f}%)\n\n"
+            
+            # Progress bar visualization
+            bar_length = 20
+            strong_bars = int((strong_pct / 100) * bar_length)
+            moderate_bars = int((moderate_pct / 100) * bar_length)
+            weak_bars = int((weak_pct / 100) * bar_length)
+            unknown_bars = bar_length - strong_bars - moderate_bars - weak_bars
+            
+            progress_bar = "🟢" * strong_bars + "🟡" * moderate_bars + "🟠" * weak_bars + "⚪" * unknown_bars
+            response += f"**Progress:** {progress_bar}\n\n"
+            
+            # Session stats
+            if state["session_active"] and state["session_quiz_performance"]["words_attempted"]:
                 perf = state["session_quiz_performance"]
-                response += f"**Current Session:**\n"
-                response += f"• Words Attempted: {len(perf['words_attempted'])}\n"
-                response += f"• Correct Answers: {len(perf['correct_answers'])}\n"
-                response += f"• Session Score: {perf.get('session_score', 0):.1%}\n\n"
+                response += "**Current Session:**\n"
+                response += f"Words attempted: {len(perf['words_attempted'])}\n"
+                response += f"Session score: {perf.get('session_score', 0):.1%}\n\n"
             
-            # Recommendations
-            if weak > 0:
-                response += f"💡 **Recommendation:** Focus on {weak} weak words with 'study weak words'\n"
-            elif unknown > 0:
-                response += f"💡 **Recommendation:** Explore {unknown} new words with 'quiz unknown words'\n"
+            # Smart recommendations
+            mastery_pct = strong_pct + moderate_pct
+            if mastery_pct >= 70:
+                response += "🎉 **Excellent!** You're mastering your vocabulary!\n"
+            elif weak_pct + unknown_pct > 50:
+                response += "💡 **Focus on studying** weak and unknown words!\n"
             else:
-                response += f"🎉 **Great job!** You're doing well. Keep practicing to maintain your progress!\n"
+                response += "👍 **Keep going!** You're making good progress!\n"
                 
         except Exception as e:
-            print(f"Error getting progress: {e}")
-            response = "Sorry, I couldn't retrieve your progress right now."
+            response = f"Error loading progress: {e}"
 
         state["messages"].append({"role": "assistant", "content": response})
+        state["last_action"] = "progress"
+        return state
+    
+    def _reset_node(self, state: AgentState) -> AgentState:
+        """Reset all progress"""
+        try:
+            import sqlite3
+            conn = sqlite3.connect("vocab.db")
+            c = conn.cursor()
+            
+            # Reset all word statuses to unknown
+            c.execute("UPDATE vocabulary SET status = 'unknown', attempts = 0, correct_attempts = 0")
+            
+            # Clear notes
+            c.execute("DELETE FROM user_notes")
+            
+            # Clear session history
+            c.execute("DELETE FROM session_history")
+            
+            conn.commit()
+            conn.close()
+            
+            # Reset session state
+            state["session_quiz_performance"] = {
+                "words_attempted": [],
+                "correct_answers": [],
+                "incorrect_answers": [],
+                "session_score": 0.0
+            }
+            state["session_active"] = False
+            state["study_words_cache"] = []
+            
+            response = "🔄 **Progress Reset Complete!**\n\n"
+            response += "• All words marked as unknown\n"
+            response += "• Notes cleared\n"
+            response += "• Session history cleared\n\n"
+            response += "Ready to start fresh! Try taking a quiz."
+            
+        except Exception as e:
+            response = f"❌ Error resetting progress: {e}"
+
+        state["messages"].append({"role": "assistant", "content": response})
+        state["last_action"] = "reset"
         return state
 
 
 
     def _study_node(self, state: AgentState) -> AgentState:
-        # Get weak words from session or database
-        weak_words = state["session_quiz_performance"]["weak_words"]
-        if not weak_words:
-            weak_from_db = get_words_by_status("weak", 3) + get_words_by_status("unknown", 3)
-            weak_words = [word for word, _ in weak_from_db[:5]]
-
-        if not weak_words:
-            response = "🎉 Great! No weak words to study. Try taking a quiz to identify areas for improvement!"
+        # ONLY show incorrect words from recent quiz, plus a few weak/unknown if needed
+        study_words = []
+        
+        # First priority: incorrect words from recent quiz
+        if state["session_quiz_performance"]["incorrect_answers"]:
+            incorrect_words = state["session_quiz_performance"]["incorrect_answers"]
+            for word in incorrect_words:
+                definition = get_word_definition(word)
+                if definition:
+                    study_words.append((word, definition))
+        
+        # Only add more words if we have very few incorrect words
+        if len(study_words) < 3:
+            weak_words = get_words_by_status("weak", 3)
+            unknown_words = get_words_by_status("unknown", 3)
+            
+            additional_words = weak_words + unknown_words
+            random.shuffle(additional_words)
+            
+            existing_words = {word for word, _ in study_words}
+            for word, definition in additional_words:
+                if word not in existing_words and len(study_words) < 3:
+                    study_words.append((word, definition))
+        
+        if not study_words:
+            response = "🎉 Great! No words to study. Try taking a quiz!"
             state["messages"].append({"role": "assistant", "content": response})
             return state
 
-        # Generate enhanced study materials
-        study_words = weak_words[:3]
-        word_definitions = [(word, get_word_definition(word)) for word in study_words]
-        mnemonics = self._generate_batch_mnemonics(word_definitions)
+        # Cache studied words for notes integration
+        state["study_words_cache"] = study_words
+        state["last_action"] = "study"
 
-        response = "📖 **Enhanced Study Session:**\n\n"
-        for i, (word, definition) in enumerate(word_definitions):
-            mnemonic = mnemonics[i] if i < len(mnemonics) else f"Remember: {word.upper()} = {definition}"
-            state["generated_mnemonics"][word] = mnemonic
-
-            response += f"**{word.upper()}**\n"
-            response += f"*Definition:* {definition}\n"
-            response += f"*Memory Trick:* {mnemonic}\n"
+        response = f"📚 **Study Session** ({len(study_words)} words):\n\n"
+        
+        for i, (word, definition) in enumerate(study_words, 1):
+            response += f"**{i}. {word.upper()}**\n"
+            response += f"📖 **Meaning:** {definition}\n"
             
             # Add example sentence
             example = get_example_sentence(word)
@@ -638,35 +860,53 @@ class GREVocabAgent:
                     save_example_sentence(word, example)
             
             if example:
-                response += f"*Example:* {example}\n"
+                response += f"📝 **Example:** {example}\n"
             
-            # Add related words using RAG
-            if self.rag_system:
-                try:
-                    related = self.rag_system.find_related_words(word, 2)
-                    if related:
-                        related_names = [r["word"] for r in related]
-                        response += f"*Related words:* {', '.join(related_names)}\n"
-                except:
-                    pass
+            # Generate mnemonic/memory trick
+            mnemonic = self._generate_memory_trick(word, definition)
+            if mnemonic:
+                response += f"🧠 **Memory Trick:** {mnemonic}\n"
             
-            # Save mnemonic as note in RAG system
-            if self.rag_system:
-                try:
-                    self.rag_system.add_note_to_rag(word, mnemonic, "mnemonic")
-                except:
-                    pass
+            # Add user notes if any
+            notes = get_notes_for_word(word)
+            if notes:
+                response += f"💭 **Your Note:** {notes[0][0]}\n"
             
             response += "\n"
 
-        response += "💡 **Study Tips:**\n"
-        response += "• Review these mnemonics regularly\n"
-        response += "• Try using the words in your own sentences\n"
-        response += "• Take a quiz to test your memory\n\n"
-        response += "Ready for a quiz or want to add your own notes?"
+        response += "💡 **Next Steps:**\n"
+        response += "• Say 'move [word] to notes' to save study content\n"
+        response += "• Say 'move all to notes' to save everything\n"
+        response += "• Add custom notes: 'note for [word]: [content]'\n"
+        response += "• Take a 'quiz' to test yourself\n"
         
         state["messages"].append({"role": "assistant", "content": response})
         return state
+
+    def _generate_memory_trick(self, word: str, definition: str) -> str:
+        """Generate a memory trick/mnemonic for a word"""
+        prompt = f"""
+        Create a memorable trick to remember the word "{word}" (meaning: {definition}).
+        
+        Make it:
+        - Short and catchy (1-2 sentences max)
+        - Use wordplay, sound associations, or visual imagery
+        - Connect the word's sound/spelling to its meaning
+        - Be creative and fun
+        
+        Examples:
+        - "SPARSE sounds like 'SPACE' - imagine things spread out in space"
+        - "ABATE sounds like 'A BAIT' - the storm took the bait and calmed down"
+        - "VERBOSE = VERB + OSE - someone who uses too many verbs!"
+        
+        Just give the memory trick, no extra text.
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            return response.content.strip()
+        except:
+            return ""
 
     def _generate_simple_mnemonic(self, word: str, definition: str) -> str:
         """Generate creative mnemonics using LLM only"""
@@ -733,11 +973,213 @@ Keep under 8 words. Just the mnemonic, no explanation."""
     def _notes_node(self, state: AgentState) -> AgentState:
         user_input = state["last_user_input"]
         
-        # Determine if this is add_note or view_notes based on current_mode
-        if state["current_mode"] == "add_note":
-            return self._handle_add_note(state)
+        # Enhanced notes management with study integration and RAG
+        return self._handle_notes_with_rag(state)
+    
+    def _handle_notes_with_rag(self, state: AgentState) -> AgentState:
+        """Enhanced notes management with RAG and study integration"""
+        user_input = state["last_user_input"]
+        
+        # Use LLM to determine note action and extract info
+        note_action = self._analyze_note_request(user_input, state)
+        
+        if note_action["action"] == "add":
+            return self._add_note_with_rag(state, note_action)
+        elif note_action["action"] == "view":
+            return self._view_notes_with_rag(state, note_action)
+        elif note_action["action"] == "search":
+            return self._search_notes_with_rag(state, note_action)
         else:
-            return self._handle_view_notes(state)
+            return self._notes_help(state)
+    
+    def _analyze_note_request(self, user_input: str, state: AgentState) -> Dict:
+        """Analyze what the user wants to do with notes"""
+        
+        # Build context from study session
+        context = ""
+        if state["last_action"] == "study" and state["study_words_cache"]:
+            studied_words = [w[0] for w in state["study_words_cache"]]
+            context = f"Recently studied words: {studied_words}"
+        
+        prompt = f"""
+        Analyze this note request for a vocabulary app. Be VERY FLEXIBLE with formats.
+        
+        User input: "{user_input}"
+        Context: {context}
+        
+        Determine the action and extract relevant information:
+        
+        Actions:
+        - add: User wants to add a note. Accept ANY format like:
+          * "note for sparse: means thin"
+          * "sparse means thin and scattered"
+          * "add note sparse is about being thin"
+          * "remember sparse = thin"
+        - view: User wants to see notes (e.g., "show my notes", "view notes")
+        - search: User wants to find specific notes (e.g., "find notes about memory")
+        
+        For ADD action, extract the word and content flexibly. Look for:
+        - Word names (especially from context if available)
+        - Any content that seems like a note/definition/memory aid
+        
+        Respond in JSON format:
+        {{
+            "action": "add/view/search",
+            "word": "word name or null",
+            "note_content": "note content or null",
+            "search_query": "search terms or null"
+        }}
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            return json.loads(response.content.strip())
+        except:
+            return {"action": "view", "word": None, "note_content": None, "search_query": None}
+    
+    def _add_note_with_rag(self, state: AgentState, note_info: Dict) -> AgentState:
+        """Add note with RAG enhancement"""
+        word = note_info.get("word")
+        note_content = note_info.get("note_content")
+        
+        if not word or not note_content:
+            response = "❌ **Couldn't understand your note request.**\n\n"
+            response += "**Try these formats:**\n"
+            response += "• 'note for sparse: means thin and scattered'\n"
+            response += "• 'sparse means thin'\n"
+            response += "• 'remember sparse = not dense'\n"
+            response += "• 'add note for verbose: talks too much'\n"
+            
+            if state["study_words_cache"]:
+                words = [w[0] for w in state["study_words_cache"][:3]]
+                response += f"\n**Recently studied:** {', '.join(words)}\n"
+                response += "You can add notes for any of these words!"
+            
+            state["messages"].append({"role": "assistant", "content": response})
+            return state
+        
+        # Save note to database
+        save_note(word, note_content, "user")
+        
+        # Add to RAG system for semantic search
+        if self.rag_system:
+            try:
+                self.rag_system.add_note_to_rag(word, note_content, "user")
+            except:
+                pass
+        
+        # Get word definition and similar notes using RAG
+        definition = get_word_definition(word)
+        similar_notes = []
+        
+        if self.rag_system:
+            try:
+                similar_notes = self.rag_system.search_similar_notes(note_content, 3)
+            except:
+                pass
+        
+        response = f"✅ **Note saved for '{word.upper()}':**\n\n"
+        response += f"*Your note:* {note_content}\n"
+        
+        if definition:
+            response += f"*Definition:* {definition}\n"
+        
+        # Show similar notes from RAG
+        if similar_notes:
+            response += f"\n🔍 **Similar notes you've made:**\n"
+            for note in similar_notes[:2]:
+                if note["word"] != word:  # Don't show the same word
+                    response += f"• **{note['word']}**: {note['note']}\n"
+        
+        response += f"\n💡 **Tip:** Your note is now searchable! Try 'find notes about [topic]'\n"
+        
+        state["messages"].append({"role": "assistant", "content": response})
+        state["last_action"] = "notes"
+        return state
+    
+    def _view_notes_with_rag(self, state: AgentState, note_info: Dict) -> AgentState:
+        """View notes with RAG organization"""
+        word = note_info.get("word")
+        
+        if word:
+            # Show notes for specific word
+            notes = get_notes_for_word(word)
+            if notes:
+                response = f"📝 **Notes for {word.upper()}:**\n\n"
+                for note_content, note_type, timestamp in notes:
+                    response += f"• {note_content}\n"
+                
+                # Show definition
+                definition = get_word_definition(word)
+                if definition:
+                    response += f"\n*Definition:* {definition}\n"
+            else:
+                response = f"No notes found for **{word}**."
+        else:
+            # Show all notes organized by RAG
+            all_notes = get_all_notes(15)
+            if all_notes:
+                response = "📝 **Your Vocabulary Notes:**\n\n"
+                for word, note, note_type, timestamp in all_notes:
+                    response += f"**{word.upper()}**: {note}\n"
+                
+                # Use RAG to suggest note themes
+                if self.rag_system and len(all_notes) > 3:
+                    response += f"\n💡 **Tip:** Try 'find notes about [memory tricks/definitions/etc]' to search your notes!\n"
+            else:
+                response = "You haven't created any notes yet. Try 'note for [word]: [content]'"
+        
+        state["messages"].append({"role": "assistant", "content": response})
+        state["last_action"] = "notes"
+        return state
+    
+    def _search_notes_with_rag(self, state: AgentState, note_info: Dict) -> AgentState:
+        """Search notes using RAG semantic search"""
+        search_query = note_info.get("search_query", "")
+        
+        if not search_query or not self.rag_system:
+            return self._view_notes_with_rag(state, {"word": None})
+        
+        try:
+            # Use RAG to find semantically similar notes
+            similar_notes = self.rag_system.search_similar_notes(search_query, 8)
+            
+            if similar_notes:
+                response = f"🔍 **Notes matching '{search_query}':**\n\n"
+                for note in similar_notes:
+                    similarity_pct = note["similarity"] * 100
+                    response += f"**{note['word'].upper()}** ({similarity_pct:.0f}% match)\n"
+                    response += f"• {note['note']}\n\n"
+            else:
+                response = f"No notes found matching '{search_query}'. Try different search terms."
+        except:
+            response = "Search temporarily unavailable. Showing all notes instead."
+            return self._view_notes_with_rag(state, {"word": None})
+        
+        state["messages"].append({"role": "assistant", "content": response})
+        state["last_action"] = "notes"
+        return state
+    
+    def _notes_help(self, state: AgentState) -> AgentState:
+        """Show notes help with study integration"""
+        response = "📝 **Notes Help:**\n\n"
+        
+        # Show study context if available
+        if state["last_action"] == "study" and state["study_words_cache"]:
+            studied_words = [w[0] for w in state["study_words_cache"][:3]]
+            response += f"**Recently studied:** {', '.join(studied_words)}\n\n"
+        
+        response += "**Commands:**\n"
+        response += "• `note for [word]: [content]` - Add a note\n"
+        response += "• `view notes` - See all your notes\n"
+        response += "• `find notes about [topic]` - Search notes with RAG\n\n"
+        
+        response += "**Examples:**\n"
+        response += "• `note for sparse: means thin and scattered`\n"
+        response += "• `find notes about memory tricks`\n"
+        
+        state["messages"].append({"role": "assistant", "content": response})
+        return state
 
     def _handle_add_note(self, state: AgentState) -> AgentState:
         """Handle adding a new note"""

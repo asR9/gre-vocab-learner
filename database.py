@@ -133,11 +133,11 @@ def sample_words_for_quiz(count: int = 5) -> List[Tuple[str, str]]:
     if not all_words:
         return []
     
-    # Define weights for different statuses
+    # Define weights for different statuses - equal high weights for unknown/weak
     status_weights = {
-        'unknown': 4,
+        'unknown': 3,
         'weak': 3,
-        'moderate': 2,
+        'moderate': 1,
         'strong': 1
     }
     

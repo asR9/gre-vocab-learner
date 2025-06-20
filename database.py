@@ -179,13 +179,13 @@ def get_words_by_status(status: str, limit: int = 10) -> List[Tuple[str, str]]:
     return words
 
 def update_word_status(word: str, correct: bool):
-    """Update word status based on quiz performance"""
+    """Update word status based on user's exact requirements"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Get current status and stats
+    # Get current status and attempts
     c.execute("""
-        SELECT status, attempts, correct_attempts 
+        SELECT status, attempts, correct_attempts, first_attempt
         FROM vocabulary 
         WHERE word = ?
     """, (word,))
@@ -194,39 +194,45 @@ def update_word_status(word: str, correct: bool):
     if not result:
         return
     
-    current_status, attempts, correct_attempts = result
+    current_status, attempts, correct_attempts, first_attempt = result
     new_attempts = attempts + 1
     new_correct = correct_attempts + (1 if correct else 0)
     
-    # Calculate accuracy
-    accuracy = new_correct / new_attempts if new_attempts > 0 else 0
+    # Track first attempt if this is the first time
+    if first_attempt is None:
+        first_attempt = correct
     
-    # Determine new status based on accuracy and current status
-    if accuracy >= 0.8 and new_attempts >= 2:
-        if current_status in ['unknown', 'weak']:
+    # User's exact logic: 
+    # 1st correct (unknown) -> strong
+    # 1st wrong, 2nd correct -> moderate  
+    # 3rd correct -> strong (else back to weak)
+    if new_attempts == 1:
+        new_status = 'strong' if correct else 'weak'
+    elif new_attempts == 2:
+        if not first_attempt and correct:
             new_status = 'moderate'
-        elif current_status == 'moderate':
+        elif correct:
             new_status = 'strong'
         else:
-            new_status = current_status
-    elif accuracy >= 0.5:
-        if current_status == 'unknown':
             new_status = 'weak'
-        else:
+    else:  # 3+ attempts
+        if correct and current_status == 'moderate':
+            new_status = 'strong'
+        elif correct:
             new_status = current_status
-    else:
-        new_status = 'weak'
+        else:
+            new_status = 'weak'
     
     # Update database
     c.execute("""
         UPDATE vocabulary 
-        SET status = ?, attempts = ?, correct_attempts = ?, last_seen = CURRENT_TIMESTAMP
+        SET status = ?, attempts = ?, correct_attempts = ?, 
+            last_seen = CURRENT_TIMESTAMP, first_attempt = ?
         WHERE word = ?
-    """, (new_status, new_attempts, new_correct, word))
+    """, (new_status, new_attempts, new_correct, first_attempt, word))
     
     conn.commit()
     conn.close()
-    
     return new_status
 
 def batch_update_word_statuses(word_results: Dict[str, bool]):
@@ -329,55 +335,11 @@ def get_all_notes(limit: int = 50) -> List[Tuple[str, str, str, str]]:
     return notes
 
 def batch_update_word_statuses_session_end(word_results: Dict[str, bool]):
-    """Update multiple word statuses at session end with first_attempt tracking"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
+    """Update multiple word statuses at session end"""
     results = {}
     for word, correct in word_results.items():
-        # Get current status and stats
-        c.execute("""
-            SELECT status, attempts, correct_attempts, first_attempt
-            FROM vocabulary 
-            WHERE word = ?
-        """, (word,))
-        
-        result = c.fetchone()
-        if not result:
-            continue
-        
-        current_status, attempts, correct_attempts, first_attempt = result
-        new_attempts = attempts + 1
-        new_correct = correct_attempts + (1 if correct else 0)
-        
-        # Track first attempt if this is the first time
-        if first_attempt is None:
-            first_attempt = correct
-        
-        # Enhanced status logic based on first attempt and performance
-        if first_attempt and correct and current_status == 'unknown':
-            new_status = 'strong'
-        elif not correct:
-            new_status = 'weak'
-        elif correct and current_status == 'weak':
-            new_status = 'moderate'
-        elif correct and current_status == 'moderate' and new_correct / new_attempts >= 0.8:
-            new_status = 'strong'
-        else:
-            new_status = current_status
-        
-        # Update database
-        c.execute("""
-            UPDATE vocabulary 
-            SET status = ?, attempts = ?, correct_attempts = ?, 
-                last_seen = CURRENT_TIMESTAMP, first_attempt = ?
-            WHERE word = ?
-        """, (new_status, new_attempts, new_correct, first_attempt, word))
-        
+        new_status = update_word_status(word, correct)
         results[word] = new_status
-    
-    conn.commit()
-    conn.close()
     return results
 
 def get_example_sentence(word: str) -> str:
@@ -404,3 +366,21 @@ def save_example_sentence(word: str, sentence: str):
     
     conn.commit()
     conn.close()
+
+def get_recent_quiz_results(limit: int = 10) -> List[Tuple[str, bool]]:
+    """Get recent quiz results for progress dots"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Simple approach: get words that were recently attempted
+    c.execute("""
+        SELECT word, (correct_attempts >= attempts/2) as mostly_correct
+        FROM vocabulary 
+        WHERE attempts > 0
+        ORDER BY last_seen DESC 
+        LIMIT ?
+    """, (limit,))
+    
+    results = c.fetchall()
+    conn.close()
+    return results

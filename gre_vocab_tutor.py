@@ -4,6 +4,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import random
 import json
+import re
+
 from database import (
     sample_words_for_quiz,
     update_word_status,
@@ -35,7 +37,7 @@ class AgentState(TypedDict):
 
 class GREVocabAgent:
     def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+        self.llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
         # Initialize RAG system
         try:
             self.rag_system = RAGSystem()
@@ -158,21 +160,50 @@ class GREVocabAgent:
             return result if result.get("is_notes_command") else None
         except Exception as e:
             print(f"Notes command detection error: {e}")
-            # Fallback: simple pattern matching
+            # Fallback: improved pattern matching
             user_input_lower = user_input.lower()
+            
+            # Check for move to notes command
             if "move" in user_input_lower and "notes" in user_input_lower:
                 if "all" in user_input_lower:
                     return {"is_notes_command": True, "action": "move_to_notes", "words": ["all"]}
-                else:
-                    # Try to extract word names
-                    words = []
-                    if study_context:
-                        for word, _ in state.get("study_words_cache", []):
-                            if word.lower() in user_input_lower:
-                                words.append(word)
-                    return {"is_notes_command": True, "action": "move_to_notes", "words": words}
-            elif "note for" in user_input_lower:
+                
+                # Extract potential words from input
+                words = []
+                if state.get("study_words_cache"):
+                    # Try to find words from the study cache that are mentioned in the input
+                    study_words = [w[0].lower() for w in state["study_words_cache"]]
+                    
+                    # Split input into tokens and look for matches with study words
+                    input_tokens = set(user_input_lower.replace(',', ' ').replace(' and ', ' ').split())
+                    
+                    # Find matches between input tokens and study words
+                    for token in input_tokens:
+                        # Skip common words
+                        if token in {'move', 'to', 'notes', 'the', 'a', 'an', 'my', 'all'}:
+                            continue
+                            
+                        # Check for exact matches first
+                        if token in study_words:
+                            words.append(token)
+                        else:
+                            # Try to find partial matches (e.g., "move rarefied" when word is "rarefy")
+                            for word in study_words:
+                                if word.startswith(token) or token in word:
+                                    words.append(word)
+                                    break
+                    
+                    # If we found words, return them
+                    if words:
+                        return {"is_notes_command": True, "action": "move_to_notes", "words": words}
+                    
+                    # If no words found but we have study words, return them all
+                    return {"is_notes_command": True, "action": "move_to_notes", "words": [w[0] for w in state["study_words_cache"]]}
+            
+            # Check for add note command
+            elif "note for" in user_input_lower or "notes for" in user_input_lower:
                 return {"is_notes_command": True, "action": "add_note"}
+                
             return None
     
     def _handle_notes_command(self, state: AgentState, notes_action: Dict) -> AgentState:
@@ -207,16 +238,13 @@ class GREVocabAgent:
         moved_count = 0
         response = "📝 **Moved to Notes:**\n\n"
         
+        # Convert study words to a dictionary for faster lookup
+        study_words_dict = {word.lower(): (word, definition) for word, definition in state["study_words_cache"]}
+        
         for word_name in words_to_move:
-            # Find the word in study cache
-            study_word = None
-            for word, definition in state["study_words_cache"]:
-                if word.lower() == word_name.lower():
-                    study_word = (word, definition)
-                    break
-            
-            if study_word:
-                word, definition = study_word
+            word_lower = word_name.lower()
+            if word_lower in study_words_dict:
+                word, definition = study_words_dict[word_lower]
                 
                 # Create comprehensive note from study content
                 note_content = f"Definition: {definition}"
@@ -231,7 +259,9 @@ class GREVocabAgent:
                 if self.rag_system:
                     try:
                         self.rag_system.add_note_to_rag(word, note_content, "study_moved")
-                    except:
+                    except Exception as e:
+                        print(f"Error adding note to RAG: {e}")
+                        # Continue even if RAG fails
                         pass
                 
                 response += f"• **{word.upper()}**: {note_content}\n"
@@ -376,9 +406,7 @@ class GREVocabAgent:
         return state
     
     def _extract_quiz_parameters(self, user_input: str) -> Dict:
-        """Extract quiz parameters from user input using simple regex"""
-        import re
-        
+        """Extract quiz parameters from user input using simple regex"""        
         # Look for numbers in the input
         numbers = re.findall(r'\b(\d+)\b', user_input.lower())
         
@@ -401,6 +429,9 @@ class GREVocabAgent:
         # Grade answers using LLM
         results = self._grade_answers(quiz_words, user_answers)
 
+        # Track weak words from this quiz
+        weak_words_from_quiz = []
+        
         # Create simplified feedback summary
         feedback = "📊 **Quiz Results:**\n\n"
         
@@ -409,34 +440,35 @@ class GREVocabAgent:
             is_correct = results.get(word, False)
             if is_correct:
                 correct_count += 1
+            else:
+                # Add incorrect words to weak words list for study
+                weak_words_from_quiz.append((word, correct_def))
             
             status = "✅" if is_correct else "❌"
             feedback += f"{status} **{word.upper()}**: {correct_def}\n"
             
-            # Add example sentence
-            example = get_example_sentence(word)
-            if not example:
-                example = self._generate_example_sentence(word, correct_def)
-                if example:
-                    save_example_sentence(word, example)
+            # Update word status in database
+            update_word_status(word, is_correct)
             
-            if example:
-                feedback += f"   *Example: {example}*\n"
-            feedback += "\n"
+            # Update session performance
+            state["session_quiz_performance"]["words_attempted"].append({
+                "word": word,
+                "correct": is_correct,
+                "timestamp": "now"
+            })
+        
+        # Store weak words from this quiz in study_words_cache
+        if weak_words_from_quiz:
+            state["study_words_cache"] = weak_words_from_quiz
+            feedback += "\n💡 I've saved the words you missed for focused study.\n"
 
-        # Update performance tracking
-        total_count = len(results)
+        # Calculate session score
+        total_count = len(quiz_words)
         session_score = correct_count / total_count if total_count > 0 else 0
-
-        state["session_quiz_performance"]["words_attempted"].extend([w for w, _ in quiz_words])
         state["session_quiz_performance"]["session_score"] = session_score
 
-        # Update word statuses immediately
-        for word, correct in results.items():
-            update_word_status(word, correct)
-
         # Performance summary
-        feedback += f"📈 **Score: {session_score:.1%}** ({correct_count}/{total_count})\n\n"
+        feedback += f"\n📈 **Score: {session_score:.1%}** ({correct_count}/{total_count})\n\n"
         
         if session_score >= 0.8:
             feedback += "🎉 Excellent work!\n"
@@ -444,6 +476,10 @@ class GREVocabAgent:
             feedback += "👍 Good progress!\n"
         else:
             feedback += "💪 Keep practicing!\n"
+        
+        # Add study suggestion if there are weak words
+        if weak_words_from_quiz:
+            feedback += "\nType 'study' to review the words you missed."
 
         # Reset quiz state
         state["current_quiz_words"] = []
@@ -453,66 +489,93 @@ class GREVocabAgent:
         return state
 
     def _grade_answers(self, quiz_words: List[tuple], user_answers: str) -> Dict[str, bool]:
-        """Grade answers using simplified LLM"""
-        results = {}
-
-        words_info = "\n".join([f"{word}: {definition}" for word, definition in quiz_words])
-
-        prompt = f"""
-        Grade these quiz answers fairly. Accept correct definitions, close synonyms, and reasonable interpretations.
-        
-        Words and correct definitions:
-        {words_info}
-        
-        User's answers: "{user_answers}"
-        
-        Mark as CORRECT if the user:
-        - Gives the correct definition or close synonym
-        - Shows clear understanding of the main meaning
-        - Uses related words that capture the essence
-        
-        Mark as INCORRECT if:
-        - Definition is wrong or unrelated
-        - Shows no understanding of the word
-        - Gives opposite meaning
-        - No answer provided for that word
-        
-        Be fair but not overly generous.
-        
-        Respond in JSON format:
-        {{"word1": true/false, "word2": true/false, ...}}
         """
+        Grade quiz answers using LLM by asking for a numbered Correct/Incorrect list
+        based on understanding rather than exact wording.
+        """
+        if not quiz_words or not user_answers.strip():
+            return {word: False for word, _ in quiz_words}
 
-        try:
-            response = self.llm.invoke([HumanMessage(content=prompt)])
-            grading_result = json.loads(response.content.strip())
-            
-            for word, _ in quiz_words:
-                results[word] = grading_result.get(word.lower(), False)
-        except:
-            # Fallback: grade each word individually
-            for word, correct_def in quiz_words:
-                results[word] = self._grade_single_word(word, correct_def, user_answers)
+        # Numbered list of just the words
+        words_list = "\n".join(
+            f"{i+1}. {word.upper()}"
+            for i, (word, _) in enumerate(quiz_words)
+        )
+
+        prompt = f"""You are a GRE vocabulary expert. Evaluate whether each user answer shows true understanding of the word’s meaning—do not require the user to match any specific wording or definition exactly.
+
+    WORDS:
+    {words_list}
+
+    USER'S ANSWERS:
+    \"{user_answers}\"
+
+    For each word, reply EXACTLY in this format (one per line):
+    1. WORD — Correct or Incorrect
+
+    “Correct” means the user’s answer demonstrates understanding, even if phrased differently.
+    “Incorrect” means the answer is wrong or unrelated.
+    """
+        # Invoke the LLM
+        response = self.llm.invoke([HumanMessage(content=prompt)])
+        text = response.content.strip()
+
+        # Parse with a simple regex
+        results = {}
+        pattern = re.compile(r'^\s*(\d+)\.\s*([A-Za-z]+)\s*—\s*(Correct|Incorrect)', re.IGNORECASE)
+        for line in text.splitlines():
+            m = pattern.match(line)
+            if m:
+                idx = int(m.group(1)) - 1
+                word = quiz_words[idx][0]
+                results[word] = (m.group(3).lower() == 'correct')
+
+        # Default any unmatched words to False
+        for word, _ in quiz_words:
+            results.setdefault(word, False)
 
         return results
 
+
     def _grade_single_word(self, word: str, correct_def: str, user_answers: str) -> bool:
-        """Grade a single word with fair scoring"""
-        prompt = f"""
-        Does the user's answer show correct understanding of "{word}" (definition: "{correct_def}")?
-        
-        User's answers: "{user_answers}"
-        
-        Accept correct definitions, close synonyms, and reasonable interpretations.
-        Reject wrong definitions, unrelated answers, or no attempt.
-        
-        Answer only "YES" or "NO".
         """
+        Grade a single word's answer using LLM with semantic understanding.
+        
+        Args:
+            word: The vocabulary word being tested
+            correct_def: The correct definition of the word
+            user_answers: Raw string of user's answers
+            
+        Returns:
+            bool: True if the answer shows understanding of the word
+        """
+        if not user_answers.strip():
+            return False
+            
+        prompt = f"""You are a GRE vocabulary expert. Evaluate if the user's answer shows understanding of the word.
+
+WORD: "{word.upper()}"
+DEFINITION: "{correct_def}"
+
+USER'S ANSWER: "{user_answers}"
+
+INSTRUCTIONS:
+1. Does the user's answer show understanding of the word's meaning?
+2. Consider:
+   - Correct definitions or close synonyms
+   - Reasonable interpretations showing understanding
+   - Related words that capture the essence
+   - Different phrasings that convey the same concept
+3. Be fair but not overly generous.
+
+RESPOND WITH ONE WORD: "YES" or "NO" (no quotes, no punctuation)"""
         
         try:
             response = self.llm.invoke([HumanMessage(content=prompt)])
-            return "yes" in response.content.lower()
-        except:
+            content = response.content.strip().lower()
+            return content.startswith('y') if content else False
+        except Exception as e:
+            print(f"Error in single word grading for '{word}': {e}")
             return False
 
     def _generate_example_sentence(self, word: str, definition: str) -> str:
@@ -701,7 +764,7 @@ class GREVocabAgent:
 
     def _progress_node(self, state: AgentState) -> AgentState:
         """Simple progress dashboard with red/green dots"""
-        from database import get_recent_quiz_results
+        from database import get_word_status_counts
         
         status_counts = get_word_status_counts()
         total_words = sum(status_counts.values())
@@ -715,20 +778,25 @@ class GREVocabAgent:
         response += f"**Total Words:** {total_words}\n"
         response += f"**Strong:** {status_counts['strong']} | **Moderate:** {status_counts['moderate']} | **Weak:** {status_counts['weak']} | **Unknown:** {status_counts['unknown']}\n\n"
         
-        # Recent quiz performance (last 10 words) - red/green dots only
-        recent_results = get_recent_quiz_results(10)
-        if recent_results:
-            response += "**Recent Quiz Performance:**\n"
-            dots = ""
-            for word, correct in recent_results:
-                dots += "🟢" if correct else "🔴"
-            response += f"{dots}\n"
-            response += f"*Last {len(recent_results)} words*\n\n"
-        
-        # Session stats
+        # Get recent quiz performance from session state
         if state["session_active"] and state["session_quiz_performance"]["words_attempted"]:
             perf = state["session_quiz_performance"]
-            response += f"**Current Session:** {len(perf['words_attempted'])} words, {perf.get('session_score', 0):.1%} score\n"
+            attempts = perf["words_attempted"]
+            
+            # Show recent quiz performance (last 10 attempts)
+            recent_attempts = attempts[-10:]  # Get last 10 attempts
+            if recent_attempts:
+                response += "**Recent Quiz Performance:**\n"
+                dots = ""
+                for attempt in recent_attempts:
+                    dots += "🟢" if attempt.get("correct", False) else "🔴"
+                response += f"{dots}\n"
+                response += f"*Last {len(recent_attempts)} words*\n\n"
+            
+            # Calculate and show session stats
+            correct_count = sum(1 for a in attempts if a.get("correct", False))
+            session_score = correct_count / len(attempts) if attempts else 0
+            response += f"**Current Session:** {len(attempts)} words, {session_score:.1%} score\n"
         
         state["messages"].append({"role": "assistant", "content": response})
         state["last_action"] = "progress"
@@ -777,16 +845,25 @@ class GREVocabAgent:
 
 
     def _study_node(self, state: AgentState) -> AgentState:
-        # Show weak/unknown words for study
-        study_words = []
-        
-        # Get weak and unknown words
-        weak_words = get_words_by_status("weak", 2)
-        unknown_words = get_words_by_status("unknown", 3)
-        
-        study_words = weak_words + unknown_words
-        random.shuffle(study_words)
-        study_words = study_words[:5]  # Limit to 5 words
+        # Check for weak words from the current quiz session first
+        if state.get("study_words_cache"):
+            study_words = state["study_words_cache"]
+            response = "📚 **Studying words from your last quiz**\n\n"
+            # Clear the cache after using it
+            state["study_words_cache"] = []
+        else:
+            # Fall back to weak/unknown words if no recent quiz words
+            study_words = []
+            
+            # Get weak and unknown words
+            weak_words = get_words_by_status("weak", 5)  # Get more words to ensure we have enough after filtering
+            unknown_words = get_words_by_status("unknown", 5)
+            
+            study_words = weak_words + unknown_words
+            random.shuffle(study_words)
+            study_words = study_words[:5]  # Limit to 5 words
+            
+            response = "📚 **Studying Weak/Unknown Words**\n\n"
         
         if not study_words:
             response = "🎉 Great! No words to study. Try taking a quiz!"

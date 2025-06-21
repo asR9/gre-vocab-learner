@@ -1,53 +1,107 @@
-# 🎓 Enhanced GRE Vocab Tutor
+# GRE Vocabulary Tutor
 
-An intelligent vocabulary learning application powered by advanced AI features including LLM-based intent classification, RAG (Retrieval-Augmented Generation), and session-based learning.
+An interactive application to help you learn and master GRE vocabulary words using spaced repetition and active recall techniques.
 
-## ✨ New Features (Priority 1 & 2 Implementation)
+## Features
 
-### 🧠 **Priority 1: High Impact, Low Effort**
+- **Interactive Quizzes**: Test your knowledge with multiple-choice questions
+- **Smart Spaced Repitition**: Words are scheduled based on your performance
+- **Word Status Tracking**: Track words as Unknown, Weak, Moderate, or Strong
+- **Study Mode**: Focus on words you need to learn the most
+- **Notes**: Add personal notes to words for better retention
+- **Progress Tracking**: Monitor your vocabulary growth over time
 
-#### 1. **LLM Intent Classification**
-- **Replaced keyword-based routing** with intelligent LLM-powered intent classification
-- **Context-aware understanding** of user inputs with conversation history
-- **Supported intents**: `start_quiz`, `study_words`, `add_note`, `view_notes`, `summarize_notes`, `get_hints`, `end_session`, `search_words`, `get_progress`, `general`
-- **Graceful fallback** for unclear intents
+## Getting Started
 
-#### 2. **Enhanced Quiz Feedback**
-- **Detailed LLM grading** with constructive feedback for each answer
-- **Automatic example sentence generation** for better context understanding
-- **Progressive encouragement** based on performance levels
-- **Smart status updates** with first-attempt tracking
+### Prerequisites
 
-#### 3. **Session-based Updates**
-- **Batch database operations** at session end for better performance
-- **Pending updates tracking** during active sessions
-- **Session summaries** with detailed performance analytics
-- **Clear session boundaries** with start/end management
+- Python 3.8+
+- OpenAI API key
 
-#### 4. **Basic Progress Dashboard**
-- **Real-time session metrics** in enhanced sidebar
-- **Visual progress indicators** with charts and progress bars
-- **Quick action buttons** for instant access to features
-- **Overall mastery tracking** with word status breakdown
+### Installation
 
-### 🔍 **Priority 2: Medium Impact, Medium Effort**
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/gre-vocab-learner.git
+   cd gre-vocab-learner
+   ```
 
-#### 1. **Chroma DB Integration for RAG**
-- **Vector embeddings** for all notes and definitions using OpenAI embeddings
-- **Semantic search capabilities** for finding similar words and concepts
-- **Smart note summarization** with query-based filtering
-- **Cross-reference functionality** linking related vocabulary
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-#### 2. **Hint System**
-- **Progressive hints** during quizzes (first letter, word length, related concepts)
-- **Context-aware suggestions** using RAG system
-- **Non-intrusive help** that doesn't break quiz flow
+3. Create a `.env` file in the project root and add your OpenAI API key:
+   ```
+   OPENAI_API_KEY=your-api-key-here
+   ```
 
-#### 3. **Markdown Notes Support**
-- **Rich text formatting** for better note organization
-- **Persistent storage** in dedicated database table
-- **Integration with RAG system** for intelligent search
-- **Multiple note types** (user notes, mnemonics, hints)
+4. Initialize the database:
+   ```bash
+   python -c "from database import init_database; init_database()"
+   ```
+
+### Running the Application
+
+Start the Streamlit app:
+
+```bash
+streamlit run app.py
+```
+
+Then open your browser to the URL shown in the terminal (usually http://localhost:8501).
+
+## Usage
+
+### Taking a Quiz
+
+1. Click "Start New Quiz" in the sidebar
+2. Read the word and select the correct definition
+3. Review the correct answer and add notes if needed
+4. Click "Next Question" to continue
+
+### Studying Words
+
+1. Click "Study Words" in the sidebar
+2. Browse through words and their definitions
+3. Expand each word to see examples and add your own notes
+4. Track your progress with the mastery percentage in the sidebar
+
+### Adding Notes
+
+1. While in quiz or study mode, find the word you want to add a note to
+2. Click on the word to expand it
+3. Type your note in the text area
+4. Click "Save Note" to store it
+
+## How It Works
+
+The application uses a spaced repetition algorithm to help you learn more efficiently:
+
+- **Unknown**: Words you haven't seen or struggled with
+- **Weak**: Words you've gotten wrong more than right
+- **Moderate**: Words you're starting to recognize
+- **Strong**: Words you consistently get right
+
+The system prioritizes words you know less well while occasionally reviewing stronger words to reinforce your memory.
+
+## Data
+
+The application comes with a default set of GRE vocabulary words in `words.csv`. You can customize this file to add your own words or modify existing ones.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Built with [Streamlit](https://streamlit.io/)
+- Powered by [OpenAI](https://openai.com/)
+- Inspired by effective language learning techniques
 
 #### 4. **Example Sentences**
 - **Auto-generated contextual examples** for each vocabulary word
